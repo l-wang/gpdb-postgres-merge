@@ -1128,7 +1128,7 @@ DoCopy(const CopyStmt *stmt, const char *queryString, uint64 *processed)
 
 			cstate->partitions = stmt->partitions;
 
-			if (Gp_role == GP_ROLE_DISPATCH && cstate->on_segment)
+			if (Gp_role == GP_ROLE_DISPATCH && cstate->on_segment && cstate->rel)
 				*processed = CopyDispatchOnSegment(cstate, stmt);
 			else
 				*processed = DoCopyTo(cstate);	/* copy from database to file */
