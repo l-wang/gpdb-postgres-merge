@@ -2243,13 +2243,9 @@ BeginCopyTo(Relation rel,
 
 	if (rel == NULL && cstate->on_segment)
 	{
-		/*
-		 * Report error because COPY ON SEGMENT doesn't know the data
-		 * location of the result of SELECT query.
-		 */
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("'COPY (SELECT ...) TO' doesn't support 'ON SEGMENT'.")));
+		if (IsA(query, Query))
+			((Query*)query)->isCTAS = true;
+
 	}
 
 	bool		pipe = (filename == NULL || (Gp_role == GP_ROLE_EXECUTE && !cstate->on_segment));
