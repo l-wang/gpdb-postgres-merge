@@ -1756,6 +1756,7 @@ BeginCopy(bool is_from,
 					   0, /* pass correct value when COPY supports no delim */
 					   true);
 
+
 	/* Process the source/target relation or query */
 	if (rel)
 	{
@@ -1807,6 +1808,13 @@ BeginCopy(bool is_from,
 
 		query = (Query *) linitial(rewritten);
 
+
+		if (cstate->on_segment)
+		{
+			if (IsA(query, Query))
+				query->isCTAS = true;
+
+		}
 		/* Query mustn't use INTO, either */
 		if (query->utilityStmt != NULL &&
 			IsA(query->utilityStmt, CreateTableAsStmt))
@@ -2207,13 +2215,6 @@ BeginCopyTo(Relation rel,
 				 errmsg("cannot copy from external relation \"%s\"",
 						RelationGetRelationName(rel)),
 				 errhint("Try the COPY (SELECT ...) TO variant.")));
-	}
-
-	if (rel == NULL && cstate->on_segment)
-	{
-		if (IsA(query, Query))
-			((Query*)query)->isCTAS = true;
-
 	}
 
 	cstate = BeginCopy(false, rel, query, queryString, attnamelist, options);
