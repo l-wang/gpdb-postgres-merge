@@ -2209,6 +2209,13 @@ BeginCopyTo(Relation rel,
 				 errhint("Try the COPY (SELECT ...) TO variant.")));
 	}
 
+	if (rel == NULL && cstate->on_segment)
+	{
+		if (IsA(query, Query))
+			((Query*)query)->isCTAS = true;
+
+	}
+
 	cstate = BeginCopy(false, rel, query, queryString, attnamelist, options);
 	oldcontext = MemoryContextSwitchTo(cstate->copycontext);
 
@@ -2239,13 +2246,6 @@ BeginCopyTo(Relation rel,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("COPY ignores external partition(s)")));
 		}
-	}
-
-	if (rel == NULL && cstate->on_segment)
-	{
-		if (IsA(query, Query))
-			((Query*)query)->isCTAS = true;
-
 	}
 
 	bool		pipe = (filename == NULL || (Gp_role == GP_ROLE_EXECUTE && !cstate->on_segment));
