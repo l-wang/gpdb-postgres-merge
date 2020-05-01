@@ -1,12 +1,12 @@
 /*-------------------------------------------------------------------------
  *
- * parse_partition.c
+ * parse_partition_gp.c
  *	  Expand GPDB legacy partition syntax to PostgreSQL commands.
  *
  * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- *	src/backend/parser/parse_partition.c
+ *	src/backend/parser/parse_partition_gp.c
  *
  *-------------------------------------------------------------------------
  */
@@ -16,22 +16,38 @@
 #include "access/table.h"
 #include "catalog/partition.h"
 #include "catalog/pg_collation.h"
-#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
-#include "commands/tablespace.h"
+#include "executor/execPartition.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
-#include "optimizer/optimizer.h"
+#include "nodes/primnodes.h"
 #include "parser/parse_expr.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_utilcmd.h"
+#include "partitioning/partdesc.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/partcache.h"
 #include "utils/rel.h"
+#include "utils/ruleutils.h"
+
+typedef struct
+{
+	PartitionKeyData *partkey;
+	Datum		endVal;
+
+	ExprState   *plusexprstate;
+	ParamListInfo plusexpr_params;
+	EState	   *estate;
+
+	Datum		currStart;
+	Datum		currEnd;
+	bool		called;
+	bool		endReached;
+} PartEveryIterator;
 
 typedef struct partname_comp
 {
@@ -39,6 +55,15 @@ typedef struct partname_comp
 	int level;
 	int partnum;
 } partname_comp;
+
+static char *ChoosePartitionName(Relation parentrel, const char *levelstr,
+								 const char *partname, int partnum);
+
+static CreateStmt *makePartitionCreateStmt(Relation parentrel, char *partname,
+										   PartitionBoundSpec *boundspec,
+										   PartitionSpec *subPart,
+										   GpPartitionElem *elem,
+										   partname_comp *partnamecomp);
 
 static List *generateRangePartitions(ParseState *pstate,
 									 Relation parentrel,
@@ -56,53 +81,10 @@ static List *generateDefaultPartition(ParseState *pstate,
 									  PartitionSpec *subPart,
 									  partname_comp *partnamecomp);
 
-static CreateStmt *makePartitionCreateStmt(Relation parentrel, char *partname,
-										   PartitionBoundSpec *boundspec,
-										   PartitionSpec *subPart,
-										   GpPartitionElem *elem,
-										   partname_comp *partnamecomp);
-
-static char *ChoosePartitionName(Relation parentrel, const char *levelstr,
-								 const char *partname, int partnum);
-
 static char *extract_tablename_from_options(List **options);
 
-/*
- * TODO: rename this. This may not just return a single partition for the case of
- * start () end () every ()
- */
-static List *
-generateSinglePartition(Relation parentrel, GpPartitionElem *elem, PartitionSpec *subPart,
-						const char *queryString, partname_comp *partnamecomp)
-{
-	List *new_parts;
-	ParseState *pstate;
-
-	pstate = make_parsestate(NULL);
-	pstate->p_sourcetext = queryString;
-
-	if (elem->isDefault)
-		new_parts = generateDefaultPartition(pstate, parentrel, elem, subPart, partnamecomp);
-	else
-	{
-		PartitionKey key = RelationGetPartitionKey(parentrel);
-		Assert(key != NULL);
-		switch (key->strategy)
-		{
-			case PARTITION_STRATEGY_RANGE:
-				new_parts = generateRangePartitions(pstate, parentrel, elem, subPart, partnamecomp);
-				break;
-
-			case PARTITION_STRATEGY_LIST:
-				new_parts = generateListPartition(pstate, parentrel, elem, subPart, partnamecomp);
-				break;
-			default:
-				elog(ERROR, "Not supported partition strategy");
-		}
-	}
-
-	return new_parts;
-}
+static Oid GpFindTargetPartition(Relation parent, GpAlterPartitionId *partid,
+								 bool missing_ok);
 
 /*
  * qsort_stmt_cmp
@@ -295,118 +277,9 @@ deduceImplicitRangeBounds(ParseState *pstate, List *origstmts, PartitionKey key)
 }
 
 /*
- * Create a list of CreateStmts, to create partitions based on 'gpPartSpec'
- * specification.
- */
-List *
-generatePartitions(Oid parentrelid, GpPartitionSpec *gpPartSpec,
-				   PartitionSpec *subPartSpec, const char *queryString,
-				   List *parentoptions, const char *parentaccessmethod)
-{
-	Relation	parentrel;
-	List	   *result = NIL;
-	ParseState *pstate;
-	ListCell	*lc;
-	List	   *ancestors = get_partition_ancestors(parentrelid);
-	partname_comp partcomp = {.tablename=NULL, .level=0, .partnum=0};
-	bool isSubTemplate;
-
-	partcomp.level = list_length(ancestors) + 1;
-
-	pstate = make_parsestate(NULL);
-	pstate->p_sourcetext = queryString;
-
-	parentrel = table_open(parentrelid, NoLock);
-
-	/* Remove "tablename" cell from parentOptions, if exists */
-	extract_tablename_from_options(&parentoptions);
-
-	if (subPartSpec)
-	{
-		if (subPartSpec->gpPartSpec)
-		{
-			Assert(subPartSpec->gpPartSpec->istemplate);
-			isSubTemplate = subPartSpec->gpPartSpec->istemplate;
-		}
-		else
-			isSubTemplate = false;
-	}
-
-	foreach(lc, gpPartSpec->partElem)
-	{
-		Node	   *n = lfirst(lc);
-
-		if (IsA(n, GpPartitionElem))
-		{
-			GpPartitionElem *elem = (GpPartitionElem *) n;
-			List	   *new_parts;
-			PartitionSpec *tmpSubPartSpec = NULL;
-
-			if (subPartSpec)
-			{
-				tmpSubPartSpec = copyObject(subPartSpec);
-				if (!isSubTemplate)
-					tmpSubPartSpec->gpPartSpec = (GpPartitionSpec*) elem->subSpec;
-			}
-
-			/* if WITH has "tablename" then it will be used as name for partition */
-			partcomp.tablename = extract_tablename_from_options(&elem->options);
-
-			if (elem->options == NIL)
-				elem->options = parentoptions ? copyObject(parentoptions) : NIL;
-			if (elem->accessMethod == NULL)
-				elem->accessMethod = parentaccessmethod ? pstrdup(parentaccessmethod) : NULL;
-
-			new_parts = generateSinglePartition(parentrel, elem, tmpSubPartSpec,
-												queryString, &partcomp);
-
-			result = list_concat(result, new_parts);
-		}
-		else if (IsA(n, ColumnReferenceStorageDirective))
-		{
-			/* GPDB_12_MERGE_FIXME */
-			elog(ERROR, "column storage directives not implemented yet");
-		}
-	}
-
-	/*
-	 * Validate and maybe update range partitions bound here instead of in
-	 * check_new_partition_bound(), because we need to modify the lower or upper
-	 * bounds for implicit START/END.
-	 */
-	/* GPDB range partition */
-	PartitionKey key = RelationGetPartitionKey(parentrel);
-	if (key->strategy == PARTITION_STRATEGY_RANGE)
-	{
-		result = deduceImplicitRangeBounds(pstate, result, key);
-	}
-
-	free_parsestate(pstate);
-
-	table_close(parentrel, NoLock);
-
-	return result;
-}
-
-/*
  * Functions for iterating through all the partition bounds based on
  * START/END/EVERY.
  */
-typedef struct
-{
-	PartitionKeyData *partkey;
-	Datum		endVal;
-
-	ExprState   *plusexprstate;
-	ParamListInfo plusexpr_params;
-	EState	   *estate;
-
-	Datum		currStart;
-	Datum		currEnd;
-	bool		called;
-	bool		endReached;
-} PartEveryIterator;
-
 static PartEveryIterator *
 initPartEveryIterator(ParseState *pstate, PartitionKeyData *partkey, const char *part_col_name,
 					  Node *start, Node *end, Node *every, int location)
@@ -660,6 +533,71 @@ nextPartBound(PartEveryIterator *iter)
 	}
 }
 
+static char *
+ChoosePartitionName(Relation parentrel, const char *levelstr,
+					const char *partname, int partnum)
+{
+	char partsubstring[NAMEDATALEN];
+
+	if (partname)
+	{
+		snprintf(partsubstring, NAMEDATALEN, "prt_%s", partname);
+		return makeObjectName(RelationGetRelationName(parentrel),
+							  levelstr,
+							  partsubstring);
+	}
+
+	Assert(partnum > 0);
+	snprintf(partsubstring, NAMEDATALEN, "prt_%d", partnum);
+	return ChooseRelationName(RelationGetRelationName(parentrel),
+							  levelstr,
+							  partsubstring,
+							  RelationGetNamespace(parentrel),
+							  false);
+}
+
+static CreateStmt *
+makePartitionCreateStmt(Relation parentrel, char *partname, PartitionBoundSpec *boundspec,
+						PartitionSpec *subPart, GpPartitionElem *elem,
+						partname_comp *partnamecomp)
+{
+	CreateStmt *childstmt;
+	RangeVar   *parentrv;
+	char	   *schemaname;
+	const char *final_part_name;
+	char levelStr[NAMEDATALEN];
+
+	snprintf(levelStr, NAMEDATALEN, "%d", partnamecomp->level);
+	if (partnamecomp->tablename)
+		final_part_name = partnamecomp->tablename;
+	else
+		final_part_name = ChoosePartitionName(parentrel, levelStr, partname,
+											  ++partnamecomp->partnum);
+
+	schemaname = get_namespace_name(parentrel->rd_rel->relnamespace);
+	parentrv = makeRangeVar(schemaname, pstrdup(RelationGetRelationName(parentrel)), -1);
+
+	childstmt = makeNode(CreateStmt);
+	childstmt->relation = makeRangeVar(schemaname, (char *)final_part_name, -1);
+	childstmt->tableElts = NIL;
+	childstmt->inhRelations = list_make1(parentrv);
+	childstmt->partbound = boundspec;
+	childstmt->partspec = subPart;
+	childstmt->ofTypename = NULL;
+	childstmt->constraints = NIL;
+	childstmt->options = elem->options ? copyObject(elem->options) : NIL;
+	childstmt->oncommit = ONCOMMIT_NOOP;  // FIXME: copy from parent stmt?
+	childstmt->tablespacename = elem->tablespacename ? pstrdup(elem->tablespacename) : NULL;
+	childstmt->accessMethod = elem->accessMethod ? pstrdup(elem->accessMethod) : NULL;
+	childstmt->if_not_exists = false;
+	childstmt->distributedBy = make_distributedby_for_rel(parentrel);
+	childstmt->partitionBy = NULL;
+	childstmt->relKind = 0;
+	childstmt->ownerid = parentrel->rd_rel->relowner;
+
+	return childstmt;
+}
+
 /* Generate partitions for START (..) END (..) EVERY (..) */
 static List *
 generateRangePartitions(ParseState *pstate,
@@ -876,71 +814,6 @@ generateDefaultPartition(ParseState *pstate,
 	return list_make1(childstmt);
 }
 
-static CreateStmt *
-makePartitionCreateStmt(Relation parentrel, char *partname, PartitionBoundSpec *boundspec,
-						PartitionSpec *subPart, GpPartitionElem *elem,
-						partname_comp *partnamecomp)
-{
-	CreateStmt *childstmt;
-	RangeVar   *parentrv;
-	char	   *schemaname;
-	const char *final_part_name;
-	char levelStr[NAMEDATALEN];
-
-	snprintf(levelStr, NAMEDATALEN, "%d", partnamecomp->level);
-	if (partnamecomp->tablename)
-		final_part_name = partnamecomp->tablename;
-	else
-		final_part_name = ChoosePartitionName(parentrel, levelStr, partname,
-											  ++partnamecomp->partnum);
-
-	schemaname = get_namespace_name(parentrel->rd_rel->relnamespace);
-	parentrv = makeRangeVar(schemaname, pstrdup(RelationGetRelationName(parentrel)), -1);
-
-	childstmt = makeNode(CreateStmt);
-	childstmt->relation = makeRangeVar(schemaname, (char *)final_part_name, -1);
-	childstmt->tableElts = NIL;
-	childstmt->inhRelations = list_make1(parentrv);
-	childstmt->partbound = boundspec;
-	childstmt->partspec = subPart;
-	childstmt->ofTypename = NULL;
-	childstmt->constraints = NIL;
-	childstmt->options = elem->options ? copyObject(elem->options) : NIL;
-	childstmt->oncommit = ONCOMMIT_NOOP;  // FIXME: copy from parent stmt?
-	childstmt->tablespacename = elem->tablespacename ? pstrdup(elem->tablespacename) : NULL;
-	childstmt->accessMethod = elem->accessMethod ? pstrdup(elem->accessMethod) : NULL;
-	childstmt->if_not_exists = false;
-	childstmt->distributedBy = make_distributedby_for_rel(parentrel);
-	childstmt->partitionBy = NULL;
-	childstmt->relKind = 0;
-	childstmt->ownerid = parentrel->rd_rel->relowner;
-
-	return childstmt;
-}
-
-static char *
-ChoosePartitionName(Relation parentrel, const char *levelstr,
-					const char *partname, int partnum)
-{
-	char partsubstring[NAMEDATALEN];
-
-	if (partname)
-	{
-		snprintf(partsubstring, NAMEDATALEN, "prt_%s", partname);
-		return makeObjectName(RelationGetRelationName(parentrel),
-							  levelstr,
-							  partsubstring);
-	}
-
-	Assert(partnum > 0);
-	snprintf(partsubstring, NAMEDATALEN, "prt_%d", partnum);
-	return ChooseRelationName(RelationGetRelationName(parentrel),
-							  levelstr,
-							  partsubstring,
-							  RelationGetNamespace(parentrel),
-							  false);
-}
-
 static char *
 extract_tablename_from_options(List **options)
 {
@@ -975,12 +848,287 @@ extract_tablename_from_options(List **options)
 	return tablename;
 }
 
+/*
+ * Build a datum according to tables partition key based on parse expr. Would
+ * have been nice if FormPartitionKeyDatum() was generic and could have been
+ * used instead.
+ */
+static void
+FormPartitionKeyDatumFromExpr(Relation rel, Node *expr, Datum *values, bool *isnull)
+{
+	PartitionKey partkey;
+	int 		num_expr;
+	ListCell   *lc;
+	int			i;
+
+	Assert(rel);
+	partkey = RelationGetPartitionKey(rel);
+	Assert(partkey != NULL);
+
+	Assert(IsA(expr, List));
+	num_expr = list_length((List *) expr);
+
+	if (num_expr > RelationGetDescr(rel)->natts)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("too many columns in boundary specification (%d > %d)",
+						num_expr, RelationGetDescr(rel)->natts)));
+
+	if (num_expr > partkey->partnatts)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("too many columns in boundary specification (%d > %d)",
+						num_expr, partkey->partnatts)));
+
+	i = 0;
+	foreach(lc, (List *) expr)
+	{
+		Const      *result;
+		char       *colname;
+		Oid			coltype;
+		int32		coltypmod;
+		Oid			partcollation;
+		Node	   *n1 = (Node *) lfirst(lc);
+
+		/* Get column's name in case we need to output an error */
+		if (partkey->partattrs[i] != 0)
+			colname = get_attname(RelationGetRelid(rel),
+								  partkey->partattrs[i], false);
+		else
+			colname = deparse_expression((Node *) linitial(partkey->partexprs),
+										 deparse_context_for(RelationGetRelationName(rel),
+															 RelationGetRelid(rel)),
+										 false, false);
+
+		coltype = get_partition_col_typid(partkey, i);
+		coltypmod = get_partition_col_typmod(partkey, i);
+		partcollation = get_partition_col_collation(partkey, i);
+		result = transformPartitionBoundValue(make_parsestate(NULL), n1,
+											  colname, coltype, coltypmod,
+											  partcollation);
+
+		values[i] = result->constvalue;
+		isnull[i] = result->constisnull;
+		i++;
+	}
+
+	for (; i < partkey->partnatts; i++)
+	{
+		values[i] = 0;
+		isnull[i] = true;
+	}
+}
+
+static Oid
+GpFindTargetPartition(Relation parent, GpAlterPartitionId *partid,
+					  bool missing_ok)
+{
+	Oid			target_relid = InvalidOid;
+
+	switch (partid->idtype)
+	{
+		case AT_AP_IDDefault:
+			/* Find default partition */
+			target_relid =
+				get_default_oid_from_partdesc(RelationGetPartitionDesc(parent));
+			if (!OidIsValid(target_relid) && !missing_ok)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("DEFAULT partition of relation \"%s\" does not exist",
+								RelationGetRelationName(parent))));
+			break;
+		case AT_AP_IDName:
+		{
+			/* Find partition by name */
+			RangeVar	*partrv;
+			char		*schemaname;
+			char		*partname;
+			Relation	partRel;
+			char partsubstring[NAMEDATALEN];
+			List	   *ancestors = get_partition_ancestors(RelationGetRelid(parent));
+			int			level = list_length(ancestors) + 1;
+			char levelStr[NAMEDATALEN];
+
+			snprintf(levelStr, NAMEDATALEN, "%d", level);
+			snprintf(partsubstring, NAMEDATALEN, "prt_%s",
+					 strVal(partid->partiddef));
+
+			partname = makeObjectName(RelationGetRelationName(parent),
+									  levelStr, partsubstring);
+
+			schemaname   = get_namespace_name(parent->rd_rel->relnamespace);
+			partrv       = makeRangeVar(schemaname, partname, -1);
+			partRel      = table_openrv_extended(partrv, AccessShareLock, missing_ok);
+			if (partRel)
+			{
+				target_relid = RelationGetRelid(partRel);
+				table_close(partRel, AccessShareLock);
+			}
+			break;
+		}
+
+		case AT_AP_IDValue:
+			{
+				Datum		values[PARTITION_MAX_KEYS];
+				bool		isnull[PARTITION_MAX_KEYS];
+				PartitionDesc partdesc = RelationGetPartitionDesc(parent);
+				int partidx;
+
+				FormPartitionKeyDatumFromExpr(parent, partid->partiddef, values, isnull);
+				partidx = get_partition_for_tuple(RelationGetPartitionKey(parent),
+												  partdesc, values, isnull);
+
+				if (partidx < 0)
+				{
+					if (missing_ok)
+						break;
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_OBJECT),
+							 errmsg("partition for specified value of %s does not exist",
+									RelationGetRelationName(parent))));
+				}
+
+				if (!partdesc->is_leaf[partidx])
+					elog(ERROR, "not implemented yet");
+
+				if (partdesc->oids[partidx] ==
+					get_default_oid_from_partdesc(RelationGetPartitionDesc(parent)))
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							 errmsg("FOR expression matches DEFAULT partition for specified value of %s",
+									RelationGetRelationName(parent)),
+							 errhint("FOR expression may only specify a non-default partition in this context.")));
+				}
+
+				target_relid = partdesc->oids[partidx];
+				break;
+			}
+
+		case AT_AP_IDNone:
+			elog(ERROR, "not expected value");
+			break;
+	}
+
+	return target_relid;
+}
+
+
+/*
+ * Create a list of CreateStmts, to create partitions based on 'gpPartSpec'
+ * specification.
+ */
+List *
+generatePartitions(Oid parentrelid, GpPartitionSpec *gpPartSpec,
+				   PartitionSpec *subPartSpec, const char *queryString,
+				   List *parentoptions, const char *parentaccessmethod)
+{
+	Relation	parentrel;
+	List	   *result = NIL;
+	ParseState *pstate;
+	ListCell	*lc;
+	List	   *ancestors = get_partition_ancestors(parentrelid);
+	partname_comp partcomp = {.tablename=NULL, .level=0, .partnum=0};
+	bool isSubTemplate;
+
+	partcomp.level = list_length(ancestors) + 1;
+
+	pstate = make_parsestate(NULL);
+	pstate->p_sourcetext = queryString;
+
+	parentrel = table_open(parentrelid, NoLock);
+
+	/* Remove "tablename" cell from parentOptions, if exists */
+	extract_tablename_from_options(&parentoptions);
+
+	if (subPartSpec)
+	{
+		if (subPartSpec->gpPartSpec)
+		{
+			Assert(subPartSpec->gpPartSpec->istemplate);
+			isSubTemplate = subPartSpec->gpPartSpec->istemplate;
+		}
+		else
+			isSubTemplate = false;
+	}
+
+	foreach(lc, gpPartSpec->partElem)
+	{
+		Node	   *n = lfirst(lc);
+
+		if (IsA(n, GpPartitionElem))
+		{
+			GpPartitionElem *elem = (GpPartitionElem *) n;
+			List	   *new_parts;
+			PartitionSpec *tmpSubPartSpec = NULL;
+
+			if (subPartSpec)
+			{
+				tmpSubPartSpec = copyObject(subPartSpec);
+				if (!isSubTemplate)
+					tmpSubPartSpec->gpPartSpec = (GpPartitionSpec*) elem->subSpec;
+			}
+
+			/* if WITH has "tablename" then it will be used as name for partition */
+			partcomp.tablename = extract_tablename_from_options(&elem->options);
+
+			if (elem->options == NIL)
+				elem->options = parentoptions ? copyObject(parentoptions) : NIL;
+			if (elem->accessMethod == NULL)
+				elem->accessMethod = parentaccessmethod ? pstrdup(parentaccessmethod) : NULL;
+
+			if (elem->isDefault)
+				new_parts = generateDefaultPartition(pstate, parentrel, elem, tmpSubPartSpec, &partcomp);
+			else
+			{
+				PartitionKey key = RelationGetPartitionKey(parentrel);
+				Assert(key != NULL);
+				switch (key->strategy)
+				{
+					case PARTITION_STRATEGY_RANGE:
+						new_parts = generateRangePartitions(pstate, parentrel, elem, tmpSubPartSpec, &partcomp);
+						break;
+
+					case PARTITION_STRATEGY_LIST:
+						new_parts = generateListPartition(pstate, parentrel, elem, tmpSubPartSpec, &partcomp);
+						break;
+					default:
+						elog(ERROR, "Not supported partition strategy");
+				}
+			}
+
+			result = list_concat(result, new_parts);
+		}
+		else if (IsA(n, ColumnReferenceStorageDirective))
+		{
+			/* GPDB_12_MERGE_FIXME */
+			elog(ERROR, "column storage directives not implemented yet");
+		}
+	}
+
+	/*
+	 * Validate and maybe update range partitions bound here instead of in
+	 * check_new_partition_bound(), because we need to modify the lower or upper
+	 * bounds for implicit START/END.
+	 */
+	/* GPDB range partition */
+	PartitionKey key = RelationGetPartitionKey(parentrel);
+	if (key->strategy == PARTITION_STRATEGY_RANGE)
+		result = deduceImplicitRangeBounds(pstate, result, key);
+
+	free_parsestate(pstate);
+	table_close(parentrel, NoLock);
+	return result;
+}
+
+
 List *
 gpTransformAlterTableStmt(
 	ParseState *pstate,
 	AlterTableStmt *stmt,
 	AlterTableCmd *cmd,
-	Relation origrel)
+	Relation origrel,
+	const char *queryString)
 {
 	Relation rel = origrel;
 	List *resultstmts = NIL;
@@ -1011,6 +1159,14 @@ gpTransformAlterTableStmt(
 		rel = table_open(partrelid, AccessShareLock);
 	}
 
+	if (rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("table \"%s\" is not partitioned",
+						RelationGetRelationName(rel))));
+	}
+
 	switch (cmd->subtype)
 	{
 		case AT_PartTruncate:
@@ -1022,33 +1178,63 @@ gpTransformAlterTableStmt(
 			RangeVar *rv;
 			Relation partrel;
 
-			if (rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("table \"%s\" is not partitioned",
-								RelationGetRelationName(rel))));
-			}
-
 			partrelid = GpFindTargetPartition(rel, pid, false);
 			Assert(OidIsValid(partrelid));
-			if (rel != origrel)
-				table_close(rel, AccessShareLock);
 			partrel = table_open(partrelid, AccessShareLock);
 			rv = makeRangeVar(get_namespace_name(RelationGetNamespace(partrel)),
 							  pstrdup(RelationGetRelationName(partrel)),
 							  pc->location);
 			truncstmt->relations = list_make1(rv);
 			table_close(partrel, AccessShareLock);
-
 			resultstmts = lappend(resultstmts, truncstmt);
 		}
-			break;
+		break;
+
+		case AT_PartAdd:			/* Add */
+		{
+			ListCell *l;
+			GpAlterPartitionCmd *add_cmd = castNode(GpAlterPartitionCmd, cmd->def);
+			GpPartitionElem *pelem = castNode(GpPartitionElem, add_cmd->arg);
+			GpPartitionSpec *gpPartSpec = makeNode(GpPartitionSpec);
+			gpPartSpec->partElem = list_make1(pelem);
+			List *cstmts = generatePartitions(RelationGetRelid(rel), gpPartSpec, NULL, queryString, NIL, NULL);
+			foreach(l, cstmts)
+			{
+				Node *stmt = (Node *) lfirst(l);
+				resultstmts = lappend(resultstmts, stmt);
+			}
+		}
+		break;
+
+		case AT_PartDrop:			/* Drop */
+		{
+			GpDropPartitionCmd *pc = castNode(GpDropPartitionCmd, cmd->def);
+			GpAlterPartitionId *pid = (GpAlterPartitionId *) pc->partid;
+			DropStmt *dropstmt = makeNode(DropStmt);
+			Oid partrelid;
+			Relation partrel;
+
+			partrelid = GpFindTargetPartition(rel, pid, pc->missing_ok);
+			if (!OidIsValid(partrelid))
+				break;
+			partrel = table_open(partrelid, AccessShareLock);
+			dropstmt->objects = list_make1(list_make2(makeString(get_namespace_name(RelationGetNamespace(partrel))),
+										   makeString(pstrdup(RelationGetRelationName(partrel)))));
+			dropstmt->removeType = OBJECT_TABLE;
+			dropstmt->behavior = pc->behavior;
+			dropstmt->missing_ok = pc->missing_ok;
+			table_close(partrel, AccessShareLock);
+			resultstmts = lappend(resultstmts, dropstmt);
+		}
+		break;
 
 		default:
 			elog(ERROR, "Not implemented");
 			break;
 	}
+
+	if (rel != origrel)
+		table_close(rel, AccessShareLock);
 
 	return resultstmts;
 }

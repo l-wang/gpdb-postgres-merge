@@ -4765,12 +4765,6 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 			pass = AT_PASS_MISC;
 			break;
 
-		/* GPDB ALTER/DROP/ADD/EXCHANGE/SPLIT PARTITION commands */
-		case AT_PartDrop:			/* DROP PARTITION */
-			ATSimplePermissions(rel, ATT_TABLE);
-			pass = AT_PASS_MISC;
-			break;
-
 		default:				/* oops */
 			elog(ERROR, "unrecognized alter table type: %d",
 				 (int) cmd->subtype);
@@ -5130,11 +5124,6 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab, Relation rel,
 			break;
 
 		case AT_PartDrop:
-			/* ATPrepCmd ensures it must be a table */
-			Assert(rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
-			ATExecPartDrop(rel, castNode(GpDropPartitionCmd, cmd->def));
-			break;
-
 		case AT_PartAdd:
 		case AT_PartTruncate:
 			/*
