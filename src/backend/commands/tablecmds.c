@@ -4765,6 +4765,14 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 			pass = AT_PASS_MISC;
 			break;
 
+		case AT_PartDrop:
+		case AT_PartAdd:
+		case AT_PartTruncate:
+			ATSimplePermissions(rel, ATT_TABLE);
+			/* No command-specific prep needed */
+			pass = AT_PASS_MISC;
+			break;
+
 		default:				/* oops */
 			elog(ERROR, "unrecognized alter table type: %d",
 				 (int) cmd->subtype);
@@ -5126,11 +5134,7 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		case AT_PartDrop:
 		case AT_PartAdd:
 		case AT_PartTruncate:
-			/*
-			 * Partition add/truncate is transformed to create/truncate stmt,
-			 * hence should never reach here.
-			 */
-			Assert(0);
+			gpTransformAlterTableStmt(rel, cmd);
 			break;
 	}
 

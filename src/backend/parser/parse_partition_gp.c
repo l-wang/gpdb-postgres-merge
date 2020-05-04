@@ -16,6 +16,7 @@
 #include "access/table.h"
 #include "catalog/partition.h"
 #include "catalog/pg_collation.h"
+#include "cdb/cdbvars.h"
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
 #include "executor/execPartition.h"
@@ -27,6 +28,7 @@
 #include "parser/parse_oper.h"
 #include "parser/parse_utilcmd.h"
 #include "partitioning/partdesc.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
@@ -1122,16 +1124,16 @@ generatePartitions(Oid parentrelid, GpPartitionSpec *gpPartSpec,
 }
 
 
-List *
-gpTransformAlterTableStmt(
-	ParseState *pstate,
-	AlterTableStmt *stmt,
-	AlterTableCmd *cmd,
-	Relation origrel,
-	const char *queryString)
+void
+gpTransformAlterTableStmt(Relation origrel, AlterTableCmd *cmd)
 {
 	Relation rel = origrel;
-	List *resultstmts = NIL;
+	PlannedStmt *pstmt;
+	List *stmts = NIL;
+	ListCell *l;
+
+	if (Gp_role != GP_ROLE_DISPATCH)
+		return;
 
 	while (cmd->subtype == AT_PartAlter)
 	{
@@ -1186,22 +1188,23 @@ gpTransformAlterTableStmt(
 							  pc->location);
 			truncstmt->relations = list_make1(rv);
 			table_close(partrel, AccessShareLock);
-			resultstmts = lappend(resultstmts, truncstmt);
+			stmts = lappend(stmts, (Node *) truncstmt);
 		}
 		break;
 
 		case AT_PartAdd:			/* Add */
 		{
 			ListCell *l;
+
 			GpAlterPartitionCmd *add_cmd = castNode(GpAlterPartitionCmd, cmd->def);
 			GpPartitionElem *pelem = castNode(GpPartitionElem, add_cmd->arg);
 			GpPartitionSpec *gpPartSpec = makeNode(GpPartitionSpec);
 			gpPartSpec->partElem = list_make1(pelem);
-			List *cstmts = generatePartitions(RelationGetRelid(rel), gpPartSpec, NULL, queryString, NIL, NULL);
+			List *cstmts = generatePartitions(RelationGetRelid(rel), gpPartSpec, NULL, NULL, NIL, NULL);
 			foreach(l, cstmts)
 			{
 				Node *stmt = (Node *) lfirst(l);
-				resultstmts = lappend(resultstmts, stmt);
+				stmts = lappend(stmts, (Node *) stmt);
 			}
 		}
 		break;
@@ -1224,7 +1227,7 @@ gpTransformAlterTableStmt(
 			dropstmt->behavior = pc->behavior;
 			dropstmt->missing_ok = pc->missing_ok;
 			table_close(partrel, AccessShareLock);
-			resultstmts = lappend(resultstmts, dropstmt);
+			stmts = lappend(stmts, (Node *)dropstmt);
 		}
 		break;
 
@@ -1236,5 +1239,25 @@ gpTransformAlterTableStmt(
 	if (rel != origrel)
 		table_close(rel, AccessShareLock);
 
-	return resultstmts;
+//	Oid origrelid = RelationGetRelid(origrel);
+//	table_close(origrel, NoLock);
+	foreach (l, stmts)
+	{
+		/* No planning needed, just make a wrapper PlannedStmt */
+		Node *stmt = (Node *) lfirst(l);
+		pstmt = makeNode(PlannedStmt);
+		pstmt->commandType = CMD_UTILITY;
+		pstmt->canSetTag = false;
+		pstmt->utilityStmt = stmt;
+		pstmt->stmt_location = -1;
+		pstmt->stmt_len = 0;
+		ProcessUtility(pstmt,
+					   synthetic_sql,
+					   PROCESS_UTILITY_SUBCOMMAND,
+					   NULL,
+					   NULL,
+					   None_Receiver,
+					   NULL);
+	}
+	//table_open(origrelid, NoLock);
 }

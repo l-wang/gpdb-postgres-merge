@@ -4338,11 +4338,8 @@ transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 			case AT_PartAdd:
 			case AT_PartTruncate:
 			case AT_PartDrop:
-			{
-				List *stmts = gpTransformAlterTableStmt(pstate, stmt, cmd, rel, queryString);
-				cxt.blist = list_concat(cxt.blist, stmts);
-			}
-			break;
+				newcmds = lappend(newcmds, cmd);
+				break;
 
             case AT_PartExchange:		/* Exchange */
             case AT_PartRename:			/* Rename */
