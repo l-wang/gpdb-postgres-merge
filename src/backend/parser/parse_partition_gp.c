@@ -1125,7 +1125,7 @@ generatePartitions(Oid parentrelid, GpPartitionSpec *gpPartSpec,
 
 
 void
-gpTransformAlterTableStmt(Relation origrel, AlterTableCmd *cmd)
+ATExecGPPartitions(Relation origrel, AlterTableCmd *cmd)
 {
 	Relation rel = origrel;
 	PlannedStmt *pstmt;
@@ -1192,23 +1192,6 @@ gpTransformAlterTableStmt(Relation origrel, AlterTableCmd *cmd)
 		}
 		break;
 
-		case AT_PartAdd:			/* Add */
-		{
-			ListCell *l;
-
-			GpAlterPartitionCmd *add_cmd = castNode(GpAlterPartitionCmd, cmd->def);
-			GpPartitionElem *pelem = castNode(GpPartitionElem, add_cmd->arg);
-			GpPartitionSpec *gpPartSpec = makeNode(GpPartitionSpec);
-			gpPartSpec->partElem = list_make1(pelem);
-			List *cstmts = generatePartitions(RelationGetRelid(rel), gpPartSpec, NULL, NULL, NIL, NULL);
-			foreach(l, cstmts)
-			{
-				Node *stmt = (Node *) lfirst(l);
-				stmts = lappend(stmts, (Node *) stmt);
-			}
-		}
-		break;
-
 		case AT_PartDrop:			/* Drop */
 		{
 			GpDropPartitionCmd *pc = castNode(GpDropPartitionCmd, cmd->def);
@@ -1239,8 +1222,6 @@ gpTransformAlterTableStmt(Relation origrel, AlterTableCmd *cmd)
 	if (rel != origrel)
 		table_close(rel, AccessShareLock);
 
-//	Oid origrelid = RelationGetRelid(origrel);
-//	table_close(origrel, NoLock);
 	foreach (l, stmts)
 	{
 		/* No planning needed, just make a wrapper PlannedStmt */
@@ -1259,5 +1240,4 @@ gpTransformAlterTableStmt(Relation origrel, AlterTableCmd *cmd)
 					   None_Receiver,
 					   NULL);
 	}
-	//table_open(origrelid, NoLock);
 }

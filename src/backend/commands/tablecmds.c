@@ -5132,9 +5132,14 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab, Relation rel,
 			break;
 
 		case AT_PartDrop:
-		case AT_PartAdd:
+		case AT_PartAlter:
 		case AT_PartTruncate:
-			gpTransformAlterTableStmt(rel, cmd);
+			ATExecGPPartitions(rel, cmd);
+			break;
+
+		case AT_PartAdd:
+			/* transformAlterTableStmt() converted it into CreateStmts */
+			Assert(0);
 			break;
 	}
 

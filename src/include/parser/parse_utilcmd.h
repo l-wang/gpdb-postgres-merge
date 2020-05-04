@@ -46,6 +46,6 @@ extern List *generatePartitions(Oid parentrelid, GpPartitionSpec *gpPartSpec,
 								PartitionSpec *subPartSpec,
 								const char *queryString, List *parentoptions,
 								const char *parentaccessmethod);
-extern void gpTransformAlterTableStmt(Relation origrel, AlterTableCmd *cmd);
+extern void ATExecGPPartitions(Relation origrel, AlterTableCmd *cmd);
 
 #endif							/* PARSE_UTILCMD_H */
