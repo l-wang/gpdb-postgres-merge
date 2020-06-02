@@ -5622,6 +5622,7 @@ _copyGpPartitionRangeSpec(const GpPartitionRangeSpec *from)
 
 	COPY_NODE_FIELD(partStart);
 	COPY_NODE_FIELD(partEnd);
+	COPY_SCALAR_FIELD(partEndEdge);
 	COPY_NODE_FIELD(partEvery);
 	COPY_STRING_FIELD(pWithTnameStr);
 	COPY_LOCATION_FIELD(location);

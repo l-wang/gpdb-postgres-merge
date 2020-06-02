@@ -5654,13 +5654,7 @@ TabPartitionBoundarySpecStart:
 TabPartitionBoundarySpecEnd:
 			END_P 
             '(' expr_list ')'
-			OptTabPartitionRangeInclusive
 				{
-					/* GPDB_12_MERGE_FIXME */
-					if (($5) && ($5) != PART_EDGE_EXCLUSIVE)
-						ereport(ERROR,
-								(errmsg("inclusive END partition boundary is no longer supported"),
-								 parser_errposition(@5)));
 					$$ = $3;
 				}
             ;
@@ -5686,13 +5680,26 @@ TabPartitionBoundarySpec:
 					$$ = (Node *)n;
 				}
 			| TabPartitionBoundarySpecStart
-              OptTabPartitionBoundarySpecEnd
-              OptTabPartitionBoundarySpecEvery  
+			  TabPartitionBoundarySpecEnd
+			  OptTabPartitionRangeInclusive
+			  OptTabPartitionBoundarySpecEvery
 				{
 					GpPartitionRangeSpec *n = makeNode(GpPartitionRangeSpec);
 					n->partStart = $1;
 					n->partEnd   = $2;
-					n->partEvery = $3;
+					n->partEndEdge = $3;
+					n->partEvery = $4;
+					n->pWithTnameStr = NULL;
+					n->location  = @1;
+					$$ = (Node *)n;
+				}
+			| TabPartitionBoundarySpecStart
+			  OptTabPartitionBoundarySpecEvery
+				{
+					GpPartitionRangeSpec *n = makeNode(GpPartitionRangeSpec);
+					n->partStart = $1;
+					n->partEnd   = NULL;
+					n->partEvery = $2;
 					n->pWithTnameStr = NULL;
 					n->location  = @1;
 					$$ = (Node *)n;

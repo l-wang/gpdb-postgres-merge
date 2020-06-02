@@ -2529,6 +2529,7 @@ typedef struct GpPartitionRangeSpec
 
 	List			   *partStart;		/* start of range */
 	List			   *partEnd;		/* end */
+	GpPartitionEdgeBounding			   partEndEdge;		/* inclusive end */
 	List 			   *partEvery;		/* every specification */
 	/* MPP-6297: check for WITH (tablename=name) clause */
 	char			   *pWithTnameStr;	/* and disable EVERY if tname set */

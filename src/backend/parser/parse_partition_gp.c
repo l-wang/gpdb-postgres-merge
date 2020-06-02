@@ -631,6 +631,7 @@ generateRangePartitions(ParseState *pstate,
 	PartEveryIterator	 *boundIter;
 	Node				 *start = NULL;
 	Node				 *end = NULL;
+	bool				 endIncl = false;
 	Node				 *every = NULL;
 	int					 i;
 
@@ -677,6 +678,8 @@ generateRangePartitions(ParseState *pstate,
 		if (list_length(boundspec->partEnd) != partkey->partnatts)
 			elog(ERROR, "invalid number of end values"); // GPDB_12_MERGE_FIXME: improve message
 		end = linitial(boundspec->partEnd);
+		endIncl = boundspec->partEndEdge == PART_EDGE_INCLUSIVE ? true : false;
+		elog(NOTICE, "partEndIncl is %d", endIncl);
 	}
 
 	/*
