@@ -275,13 +275,88 @@ deduceImplicitRangeBounds(ParseState *pstate, List *origstmts, PartitionKey key)
 	return stmts;
 }
 
+static ExprState *
+initPlusExprState(ParseState *pstate, EState *estate, const char *part_col_name,
+				  Oid part_col_typid, int32 part_col_typmod,
+				  Oid part_col_collation, Node *interval)
+{
+	Node          *plusexpr;
+	Param         *param;
+	ParamListInfo plusexpr_params;
+
+	/*
+	 * NOTE: We don't use transformPartitionBoundValue() here. We don't want to cast
+	 * the EVERY clause to that type; rather, we'll be passing it to the + operator.
+	 * For example, if the partition column is a timestamp, the EVERY clause
+	 * can be an interval, so don't try to cast it to timestamp.
+	 */
+
+	param = makeNode(Param);
+	param->paramkind = PARAM_EXTERN;
+	param->paramid = 1;
+	param->paramtype = part_col_typid;
+	param->paramtypmod = part_col_typmod;
+	param->paramcollid = part_col_collation;
+	param->location = -1;
+
+	/* Look up + operator */
+	plusexpr = (Node *) make_op(pstate,
+								list_make2(makeString("pg_catalog"), makeString("+")),
+								(Node *) param,
+								(Node *) transformExpr(pstate, interval, EXPR_KIND_PARTITION_BOUND),
+								pstate->p_last_srf,
+								-1);
+
+	/*
+	 * Check that the input expression's collation is compatible with one
+	 * specified for the parent's partition key (partcollation).  Don't throw
+	 * an error if it's the default collation which we'll replace with the
+	 * parent's collation anyway.
+	 */
+	if (IsA(plusexpr, CollateExpr))
+	{
+		Oid			exprCollOid = exprCollation(plusexpr);
+
+		if (OidIsValid(exprCollOid) &&
+			exprCollOid != DEFAULT_COLLATION_OID &&
+			exprCollOid != part_col_collation)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+						errmsg("collation of partition bound value for column \"%s\" does not match partition key collation \"%s\"",
+							   part_col_name, get_collation_name(part_col_collation))));
+	}
+
+	plusexpr = coerce_to_target_type(pstate,
+									 plusexpr, exprType(plusexpr),
+									 part_col_typid,
+									 part_col_typmod,
+									 COERCION_ASSIGNMENT,
+									 COERCE_IMPLICIT_CAST,
+									 -1);
+	if (plusexpr == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+					errmsg("specified value cannot be cast to type %s for column \"%s\"",
+						   format_type_be(part_col_typid), part_col_name)));
+
+	plusexpr_params = makeParamList(1);
+	plusexpr_params->params[0].value = (Datum) 0;
+	plusexpr_params->params[0].isnull = true;
+	plusexpr_params->params[0].pflags = 0;
+	plusexpr_params->params[0].ptype = part_col_typid;
+
+	estate->es_param_list_info = plusexpr_params;
+
+	return ExecInitExprWithParams((Expr *) plusexpr, plusexpr_params);
+}
+
 /*
  * Functions for iterating through all the partition bounds based on
  * START/END/EVERY.
  */
 static PartEveryIterator *
 initPartEveryIterator(ParseState *pstate, PartitionKeyData *partkey, const char *part_col_name,
-					  Node *start, Node *end, Node *every)
+					  Node *start, Node *end, bool endIncl, Node *every)
 {
 	PartEveryIterator *iter;
 	Datum		startVal = 0;
@@ -331,11 +406,43 @@ initPartEveryIterator(ParseState *pstate, PartitionKeyData *partkey, const char 
 												part_col_collation);
 		if (endConst->constisnull)
 			ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-				 errmsg("cannot use NULL with range partition specification"),
-				 parser_errposition(pstate, exprLocation(end))));
+					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+						errmsg("cannot use NULL with range partition specification"),
+						parser_errposition(pstate, exprLocation(end))));
 
-		endVal = endConst->constvalue;
+		if (endIncl)
+		{
+			ExprState	*plusexprstate;
+			EState		*estate;
+			A_Const		*one;
+			Datum 		endplusone;
+			bool		isnull;
+
+			one = makeNode(A_Const);
+			one->val.type = T_Integer;
+			one->val.val.ival = 1;
+			one->location = -1;
+			estate = CreateExecutorState();
+			plusexprstate = initPlusExprState(pstate,
+											  estate,
+											  part_col_name,
+											  part_col_typid,
+											  part_col_typmod,
+											  part_col_collation,
+											  (Node *) one);
+
+			estate->es_param_list_info->params[0].isnull = false;
+			estate->es_param_list_info->params[0].value = endConst->constvalue;
+			endplusone = ExecEvalExprSwitchContext(plusexprstate,
+												   GetPerTupleExprContext(estate),
+												   &isnull);
+			if (isnull)
+				elog(ERROR, "plus-operator returned NULL"); // GPDB_12_MERGE_FIXME: better message
+
+			endVal = endplusone;
+		}
+		else
+			endVal = endConst->constvalue;
 	}
 
 	iter = palloc0(sizeof(PartEveryIterator));
@@ -344,9 +451,6 @@ initPartEveryIterator(ParseState *pstate, PartitionKeyData *partkey, const char 
 
 	if (every)
 	{
-		Node	   *plusexpr;
-		Param	   *param;
-
 		if (start == NULL || end == NULL)
 		{
 			ereport(ERROR,
@@ -355,72 +459,15 @@ initPartEveryIterator(ParseState *pstate, PartitionKeyData *partkey, const char 
 				 parser_errposition(pstate, exprLocation(every))));
 		}
 
-		/*
-		 * NOTE: We don't use transformPartitionBoundValue() here. We don't want to cast
-		 * the EVERY clause to that type; rather, we'll be passing it to the + operator.
-		 * For example, if the partition column is a timestamp, the EVERY clause
-		 * can be an interval, so don't try to cast it to timestamp.
-		 */
-
-		param = makeNode(Param);
-		param->paramkind = PARAM_EXTERN;
-		param->paramid = 1;
-		param->paramtype = part_col_typid;
-		param->paramtypmod = part_col_typmod;
-		param->paramcollid = part_col_collation;
-		param->location = -1;
-
-		/* Look up + operator */
-		plusexpr = (Node *) make_op(pstate,
-									list_make2(makeString("pg_catalog"), makeString("+")),
-									(Node *) param,
-									(Node *) transformExpr(pstate, every, EXPR_KIND_PARTITION_BOUND),
-									pstate->p_last_srf,
-									-1);
-
-		/*
-		 * Check that the input expression's collation is compatible with one
-		 * specified for the parent's partition key (partcollation).  Don't throw
-		 * an error if it's the default collation which we'll replace with the
-		 * parent's collation anyway.
-		 */
-		if (IsA(plusexpr, CollateExpr))
-		{
-			Oid			exprCollOid = exprCollation(plusexpr);
-
-			if (OidIsValid(exprCollOid) &&
-				exprCollOid != DEFAULT_COLLATION_OID &&
-				exprCollOid != part_col_collation)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATATYPE_MISMATCH),
-						 errmsg("collation of partition bound value for column \"%s\" does not match partition key collation \"%s\"",
-								part_col_name, get_collation_name(part_col_collation))));
-		}
-
-		plusexpr = coerce_to_target_type(pstate,
-										 plusexpr, exprType(plusexpr),
-										 part_col_typid,
-										 part_col_typmod,
-										 COERCION_ASSIGNMENT,
-										 COERCE_IMPLICIT_CAST,
-										 -1);
-		if (plusexpr == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("specified value cannot be cast to type %s for column \"%s\"",
-							format_type_be(part_col_typid), part_col_name)));
-
 		iter->estate = CreateExecutorState();
-
-		iter->plusexpr_params = makeParamList(1);
-		iter->plusexpr_params->params[0].value = (Datum) 0;
-		iter->plusexpr_params->params[0].isnull = true;
-		iter->plusexpr_params->params[0].pflags = 0;
-		iter->plusexpr_params->params[0].ptype = part_col_typid;
-
-		iter->estate->es_param_list_info = iter->plusexpr_params;
-
-		iter->plusexprstate = ExecInitExprWithParams((Expr *) plusexpr, iter->plusexpr_params);
+		iter->plusexprstate = initPlusExprState(pstate,
+												iter->estate,
+												part_col_name,
+												part_col_typid,
+												part_col_typmod,
+												part_col_collation,
+												every);
+		iter->plusexpr_params = iter->estate->es_param_list_info;
 	}
 	else
 	{
@@ -699,7 +746,7 @@ generateRangePartitions(ParseState *pstate,
 
 	partkey = RelationGetPartitionKey(parentrel);
 
-	boundIter = initPartEveryIterator(pstate, partkey, partcolname, start, end, every);
+	boundIter = initPartEveryIterator(pstate, partkey, partcolname, start, end, endIncl, every);
 
 	i = 0;
 	while (nextPartBound(boundIter))
