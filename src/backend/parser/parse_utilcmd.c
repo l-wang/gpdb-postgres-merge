@@ -4967,40 +4967,99 @@ transformPartitionBound(ParseState *pstate, Relation parent,
 										 deparse_context_for(RelationGetRelationName(parent),
 															 RelationGetRelid(parent)),
 										 false, false);
-		/* Need its type data too */
-		coltype = get_partition_col_typid(key, 0);
-		coltypmod = get_partition_col_typmod(key, 0);
-		partcollation = get_partition_col_collation(key, 0);
 
 		result_spec->listdatums = NIL;
 		foreach(cell, spec->listdatums)
 		{
-			Node	   *expr = lfirst(cell);
-			Const	   *value;
-			ListCell   *cell2;
-			bool		duplicate;
-
-			value = transformPartitionBoundValue(pstate, expr,
-												 colname, coltype, coltypmod,
-												 partcollation);
-
-			/* Don't add to the result if the value is a duplicate */
-			duplicate = false;
-			foreach(cell2, result_spec->listdatums)
+			if (key->partnatts == 1)
 			{
-				Const	   *value2 = castNode(Const, lfirst(cell2));
+				Node	   *expr = lfirst(cell);
+				Const	   *value;
+				ListCell   *cell2;
+				bool		duplicate;
 
-				if (equal(value, value2))
+				Assert(key->partnatts == 1);
+				/* Need its type data too */
+				coltype = get_partition_col_typid(key, 0);
+				coltypmod = get_partition_col_typmod(key, 0);
+				partcollation = get_partition_col_collation(key, 0);
+
+				value = transformPartitionBoundValue(pstate, expr,
+													 colname, coltype, coltypmod,
+													 partcollation);
+
+				/* Don't add to the result if the value is a duplicate */
+				duplicate = false;
+				foreach(cell2, result_spec->listdatums)
 				{
-					duplicate = true;
-					break;
-				}
-			}
-			if (duplicate)
-				continue;
+					Const	   *value2 = castNode(Const, lfirst(cell2));
 
-			result_spec->listdatums = lappend(result_spec->listdatums,
-											  value);
+					if (equal(value, value2))
+					{
+						duplicate = true;
+						break;
+					}
+				}
+				if (duplicate)
+					continue;
+
+				result_spec->listdatums = lappend(result_spec->listdatums,
+												  value);
+			}
+			else
+			{
+				RowExpr 		*rowExpr = lfirst(cell);
+				ListCell    *c;
+				List *tmplist = NIL;
+				int j = 0;
+				ListCell   *c2;
+				bool		duplicate;
+
+				Assert(key->partnatts > 1);
+				if (!IsA(lfirst(cell), RowExpr) ||
+					key->partnatts != list_length(rowExpr->args))
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+								errmsg("partition key has %i columns but %i column%s specified in VALUES clause",
+									   key->partnatts,
+									   IsA(lfirst(cell), RowExpr) ? list_length(rowExpr->args) : 1,
+									   (IsA(lfirst(cell), RowExpr) && list_length(rowExpr->args)) ? "s" : ""),
+								parser_errposition(pstate, spec->location)));
+				}
+
+				foreach(c, rowExpr->args)
+				{
+					Node	   *expr = lfirst(c);
+					Const	   *value;
+
+					/* Need its type data too */
+					coltype = get_partition_col_typid(key, j);
+					coltypmod = get_partition_col_typmod(key, j);
+					partcollation = get_partition_col_collation(key, j++);
+
+					value = transformPartitionBoundValue(pstate, expr,
+														 colname, coltype, coltypmod,
+														 partcollation);
+
+					tmplist = lappend(tmplist,value);
+				}
+				/* Don't add to the result if the value is a duplicate */
+				duplicate = false;
+				foreach(c2, result_spec->listdatums)
+				{
+					List		*list2 = lfirst(c2);
+
+					if (equal(tmplist, list2))
+					{
+						duplicate = true;
+						break;
+					}
+				}
+				if (duplicate)
+					continue;
+				result_spec->listdatums = lappend(result_spec->listdatums, tmplist);
+			}
 		}
 	}
 	else if (strategy == PARTITION_STRATEGY_RANGE)

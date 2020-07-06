@@ -9111,10 +9111,31 @@ get_rule_expr(Node *node, deparse_context *context,
 						sep = "";
 						foreach(cell, spec->listdatums)
 						{
-							Const	   *val = castNode(Const, lfirst(cell));
+							Const *val;
+							if (IsA(lfirst(cell), List))
+							{
+								List *tmplist = lfirst(cell);
+								ListCell *c;
+								char *in_sep = "";
+								appendStringInfoString(buf, sep);
+								appendStringInfoString(buf, "(");
+								foreach(c, tmplist)
+								{
+									val = castNode(Const, lfirst(c));
 
-							appendStringInfoString(buf, sep);
-							get_const_expr(val, context, -1);
+									appendStringInfoString(buf, in_sep);
+									get_const_expr(val, context, -1);
+									in_sep = ", ";
+								}
+								appendStringInfoString(buf, ")");
+							}
+							else
+							{
+								val = castNode(Const, lfirst(cell));
+
+								appendStringInfoString(buf, sep);
+								get_const_expr(val, context, -1);
+							}
 							sep = ", ";
 						}
 

@@ -50,6 +50,8 @@ extern List *generatePartitions(Oid parentrelid, GpPartitionDefinition *gpPartSp
 extern void convert_exclusive_start_inclusive_end(Const *constval, Oid part_col_typid,
 												  int32 part_col_typmod, bool is_exclusive_start);
 
+extern Datum *consts_to_datums(PartitionKey partkey, List *consts);
+
 typedef struct partname_comp
 {
 	const char *tablename;

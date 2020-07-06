@@ -285,7 +285,7 @@ datums_to_consts(PartitionKey partkey, Datum *datums)
 	return result;
 }
 
-static Datum *
+Datum *
 consts_to_datums(PartitionKey partkey, List *consts)
 {
 	Datum	   *datums;
@@ -293,7 +293,7 @@ consts_to_datums(PartitionKey partkey, List *consts)
 	int			i;
 
 	if (partkey->partnatts != list_length(consts))
-		elog(ERROR, "wrong number of partition bounds");
+		elog(ERROR, "wrong number of partition bounds, expected number of attributes is %d, got %d", partkey->partattrs, list_length(consts));
 
 	datums = palloc(partkey->partnatts * sizeof(Datum));
 

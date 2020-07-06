@@ -66,7 +66,7 @@ typedef struct PartitionBoundInfoData
 									 * NULL for hash and list partitioned
 									 * tables */
 	int		   *indexes;		/* Partition indexes */
-	int			null_index;		/* Index of the null-accepting partition; -1
+	int			null_index;		/* TODO: make this into an array? Index of the null-accepting partition; -1
 								 * if there isn't one */
 	int			default_index;	/* Index of the default partition; -1 if there
 								 * isn't one */
@@ -101,8 +101,9 @@ extern int32 partition_rbound_datum_cmp(FmgrInfo *partsupfunc,
 										Datum *tuple_datums, int n_tuple_datums);
 extern int	partition_list_bsearch(FmgrInfo *partsupfunc,
 								   Oid *partcollation,
+								   int partnatts,
 								   PartitionBoundInfo boundinfo,
-								   Datum value, bool *is_equal);
+								   Datum *values, bool *is_equal);
 extern int	partition_range_datum_bsearch(FmgrInfo *partsupfunc,
 										  Oid *partcollation,
 										  PartitionBoundInfo boundinfo,

@@ -19075,7 +19075,7 @@ transformPartitionSpec(Relation rel, PartitionSpec *partspec, char *strategy)
 	/* Check valid number of columns for strategy */
 	if (*strategy == PARTITION_STRATEGY_LIST &&
 		list_length(partspec->partParams) != 1)
-		ereport(ERROR,
+		ereport(NOTICE,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 				 errmsg("cannot use \"list\" partition strategy with more than one column")));
 

@@ -181,7 +181,7 @@ static PruneStepResult *get_matching_hash_bounds(PartitionPruneContext *context,
 												 StrategyNumber opstrategy, Datum *values, int nvalues,
 												 FmgrInfo *partsupfunc, Bitmapset *nullkeys);
 static PruneStepResult *get_matching_list_bounds(PartitionPruneContext *context,
-												 StrategyNumber opstrategy, Datum value, int nvalues,
+												 StrategyNumber opstrategy, Datum *values, int nvalues,
 												 FmgrInfo *partsupfunc, Bitmapset *nullkeys);
 static PruneStepResult *get_matching_range_bounds(PartitionPruneContext *context,
 												  StrategyNumber opstrategy, Datum *values, int nvalues,
@@ -2426,7 +2426,7 @@ get_matching_hash_bounds(PartitionPruneContext *context,
  */
 static PruneStepResult *
 get_matching_list_bounds(PartitionPruneContext *context,
-						 StrategyNumber opstrategy, Datum value, int nvalues,
+						 StrategyNumber opstrategy, Datum *values, int nvalues,
 						 FmgrInfo *partsupfunc, Bitmapset *nullkeys)
 {
 	PruneStepResult *result = (PruneStepResult *) palloc0(sizeof(PruneStepResult));
@@ -2494,8 +2494,8 @@ get_matching_list_bounds(PartitionPruneContext *context,
 		result->bound_offsets = bms_add_range(NULL, 0,
 											  boundinfo->ndatums - 1);
 
-		off = partition_list_bsearch(partsupfunc, partcollation, boundinfo,
-									 value, &is_equal);
+		off = partition_list_bsearch(partsupfunc, partcollation, context->partnatts, boundinfo,
+									 values, &is_equal);
 		if (off >= 0 && is_equal)
 		{
 
@@ -2527,7 +2527,8 @@ get_matching_list_bounds(PartitionPruneContext *context,
 		case BTEqualStrategyNumber:
 			off = partition_list_bsearch(partsupfunc,
 										 partcollation,
-										 boundinfo, value,
+										 context->partnatts,
+										 boundinfo, values,
 										 &is_equal);
 			if (off >= 0 && is_equal)
 			{
@@ -2544,7 +2545,8 @@ get_matching_list_bounds(PartitionPruneContext *context,
 		case BTGreaterStrategyNumber:
 			off = partition_list_bsearch(partsupfunc,
 										 partcollation,
-										 boundinfo, value,
+										 context->partnatts,
+										 boundinfo, values,
 										 &is_equal);
 			if (off >= 0)
 			{
@@ -2579,7 +2581,8 @@ get_matching_list_bounds(PartitionPruneContext *context,
 		case BTLessStrategyNumber:
 			off = partition_list_bsearch(partsupfunc,
 										 partcollation,
-										 boundinfo, value,
+										 context->partnatts,
+										 boundinfo, values,
 										 &is_equal);
 			if (off >= 0 && is_equal && !inclusive)
 				off--;
@@ -3267,7 +3270,7 @@ perform_pruning_base_step(PartitionPruneContext *context,
 		case PARTITION_STRATEGY_LIST:
 			return get_matching_list_bounds(context,
 											opstep->opstrategy,
-											values[0], nvalues,
+											values, nvalues,
 											&partsupfunc[0],
 											opstep->nullkeys);
 

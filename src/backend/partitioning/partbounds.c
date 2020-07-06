@@ -26,6 +26,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_coerce.h"
+#include "parser/parse_utilcmd.h"
 #include "partitioning/partbounds.h"
 #include "partitioning/partdesc.h"
 #include "partitioning/partprune.h"
@@ -59,7 +60,7 @@ typedef struct PartitionHashBound
 typedef struct PartitionListValue
 {
 	int			index;
-	Datum		value;
+	Datum		*values;
 } PartitionListValue;
 
 /* One bound of a range partition */
@@ -349,28 +350,57 @@ create_list_bounds(PartitionBoundSpec **boundspecs, int nparts,
 
 		foreach(c, spec->listdatums)
 		{
-			Const	   *val = castNode(Const, lfirst(c));
+			List *tmplist = lfirst(c);
 			PartitionListValue *list_value = NULL;
-
-			if (!val->constisnull)
+			list_value = (PartitionListValue *) palloc0(sizeof(PartitionListValue));
+			list_value->values = (Datum *) palloc0(key->partnatts * sizeof(Datum));
+			int j = 0;
+			if (IsA(lfirst(c), List))
 			{
-				list_value = (PartitionListValue *)
-					palloc0(sizeof(PartitionListValue));
-				list_value->index = i;
-				list_value->value = val->constvalue;
+				ListCell *cell;
+				foreach(cell, tmplist)
+				{
+					Const	   *val = castNode(Const, lfirst(cell));
+
+					if (!val->constisnull)
+					{
+						list_value->index = i;
+						list_value->values[j++] = val->constvalue;
+					}
+					else
+					{
+						/*
+						 * Never put a null into the values array, flag instead for
+						 * the code further down below where we construct the actual
+						 * relcache struct.
+						 */
+						if (null_index != -1)
+							elog(ERROR, "found null more than once");
+						null_index = i;
+					}
+				}
 			}
 			else
 			{
-				/*
-				 * Never put a null into the values array, flag instead for
-				 * the code further down below where we construct the actual
-				 * relcache struct.
-				 */
-				if (null_index != -1)
-					elog(ERROR, "found null more than once");
-				null_index = i;
-			}
+				Const	   *val = castNode(Const, lfirst(c));
 
+				if (!val->constisnull)
+				{
+					list_value->index = i;
+					list_value->values[0] = val->constvalue;
+				}
+				else
+				{
+					/*
+					 * Never put a null into the values array, flag instead for
+					 * the code further down below where we construct the actual
+					 * relcache struct.
+					 */
+					if (null_index != -1)
+						elog(ERROR, "found null more than once");
+					null_index = i;
+				}
+			}
 			if (list_value)
 				non_null_values = lappend(non_null_values, list_value);
 		}
@@ -391,7 +421,8 @@ create_list_bounds(PartitionBoundSpec **boundspecs, int nparts,
 
 		all_values[i] = (PartitionListValue *)
 			palloc(sizeof(PartitionListValue));
-		all_values[i]->value = src->value;
+		all_values[i]->values = (Datum *)palloc(key->partnatts * sizeof(Datum));
+		memcpy(all_values[i]->values, src->values, key->partnatts * sizeof(Datum));
 		all_values[i]->index = src->index;
 		i++;
 	}
@@ -413,10 +444,13 @@ create_list_bounds(PartitionBoundSpec **boundspecs, int nparts,
 	{
 		int			orig_index = all_values[i]->index;
 
-		boundinfo->datums[i] = (Datum *) palloc(sizeof(Datum));
-		boundinfo->datums[i][0] = datumCopy(all_values[i]->value,
-											key->parttypbyval[0],
-											key->parttyplen[0]);
+		boundinfo->datums[i] = (Datum *) palloc(key->partnatts * sizeof(Datum));
+		for(int k = 0; k < key->partnatts; k++)
+		{
+			boundinfo->datums[i][k] = datumCopy(all_values[i]->values[k],
+												key->parttypbyval[k],
+												key->parttyplen[k]);
+		}
 
 		/* If the old index has no mapping, assign one */
 		if ((*mapping)[orig_index] == -1)
@@ -798,7 +832,7 @@ partition_bounds_copy(PartitionBoundInfo src,
 	num_indexes = get_partition_bound_num_indexes(src);
 
 	/* List partitioned tables have only a single partition key. */
-	Assert(key->strategy != PARTITION_STRATEGY_LIST || partnatts == 1);
+//	Assert(key->strategy != PARTITION_STRATEGY_LIST || partnatts == 1);
 
 	dest->datums = (Datum **) palloc(sizeof(Datum *) * ndatums);
 
@@ -1064,29 +1098,30 @@ check_new_partition_bound(char *relname, Relation parent,
 
 					foreach(cell, spec->listdatums)
 					{
-						Const	   *val = castNode(Const, lfirst(cell));
-
-						if (!val->constisnull)
+						Datum *values;
+						int			offset;
+						bool		equal;
+						if (IsA(lfirst(cell), List))
 						{
-							int			offset;
-							bool		equal;
-
-							offset = partition_list_bsearch(&key->partsupfunc[0],
-															key->partcollation,
-															boundinfo,
-															val->constvalue,
-															&equal);
-							if (offset >= 0 && equal)
-							{
-								overlap = true;
-								with = boundinfo->indexes[offset];
-								break;
-							}
+							List 		*list = lfirst(cell);
+							values = consts_to_datums(key, list);
 						}
-						else if (partition_bound_accepts_nulls(boundinfo))
+						else
+						{
+							Const	   *val = castNode(Const, lfirst(cell));
+							values[0] = val->constvalue;
+						}
+
+						offset = partition_list_bsearch(key->partsupfunc,
+														key->partcollation,
+														key->partnatts,
+														boundinfo,
+														values,
+														&equal);
+						if (offset >= 0 && equal)
 						{
 							overlap = true;
-							with = boundinfo->null_index;
+							with = boundinfo->indexes[offset];
 							break;
 						}
 					}
@@ -1577,9 +1612,9 @@ partition_hbound_cmp(int modulus1, int remainder1, int modulus2, int remainder2)
  * to the input value.
  */
 int
-partition_list_bsearch(FmgrInfo *partsupfunc, Oid *partcollation,
+partition_list_bsearch(FmgrInfo *partsupfunc, Oid *partcollation, int partnatts,
 					   PartitionBoundInfo boundinfo,
-					   Datum value, bool *is_equal)
+					   Datum *values, bool *is_equal)
 {
 	int			lo,
 				hi,
@@ -1592,10 +1627,28 @@ partition_list_bsearch(FmgrInfo *partsupfunc, Oid *partcollation,
 		int32		cmpval;
 
 		mid = (lo + hi + 1) / 2;
-		cmpval = DatumGetInt32(FunctionCall2Coll(&partsupfunc[0],
-												 partcollation[0],
-												 boundinfo->datums[mid][0],
-												 value));
+
+		/*
+		 * GPDB_12_MERGE_FIXME: this is copied from qsort_partition_list_value_cmp()
+		 * because not all callers of this function has the PartitionKey variable
+		 * available to pass down.
+		 */
+		cmpval = 0;
+		for (int i = 0; i < partnatts; i++)
+		{
+			int32 cmpval_in = 0;
+			Datum		val2 = values[i];
+			Datum		val1 = boundinfo->datums[mid][i];
+			cmpval_in = DatumGetInt32(FunctionCall2Coll(&partsupfunc[i],
+													 partcollation[i],
+													 val1, val2));
+			if (cmpval_in != 0)
+			{
+				cmpval = cmpval_in;
+				break;
+			}
+		}
+
 		if (cmpval <= 0)
 		{
 			lo = mid;
@@ -1766,13 +1819,20 @@ qsort_partition_hbound_cmp(const void *a, const void *b)
 static int32
 qsort_partition_list_value_cmp(const void *a, const void *b, void *arg)
 {
-	Datum		val1 = (*(PartitionListValue *const *) a)->value,
-				val2 = (*(PartitionListValue *const *) b)->value;
 	PartitionKey key = (PartitionKey) arg;
 
-	return DatumGetInt32(FunctionCall2Coll(&key->partsupfunc[0],
-										   key->partcollation[0],
-										   val1, val2));
+	for (int i = 0; i < key->partnatts; i++)
+	{
+		int cmpval;
+		Datum		val1 = (*(PartitionListValue *const *) a)->values[i],
+					 val2 = (*(PartitionListValue *const *) b)->values[i];
+		cmpval = DatumGetInt32(FunctionCall2Coll(&key->partsupfunc[i],
+											   key->partcollation[i],
+											   val1, val2));
+		if (cmpval != 0)
+			return cmpval;
+	}
+	return 0;
 }
 
 /*
@@ -1912,7 +1972,7 @@ make_partition_op_expr(PartitionKey key, int keynum,
 				int			nelems = list_length(elems);
 
 				Assert(nelems >= 1);
-				Assert(keynum == 0);
+				//Assert(keynum == 0);
 
 				if (nelems > 1 &&
 					!type_is_array(key->parttypid[keynum]))
@@ -2075,7 +2135,7 @@ get_qual_for_hash(Relation parent, PartitionBoundSpec *spec)
  * partition since in that case there is no constraint.
  */
 static List *
-get_qual_for_list(Relation parent, PartitionBoundSpec *spec)
+get_qual_for_list_internal(Relation parent, PartitionBoundSpec *spec, int partkeyindex)
 {
 	PartitionKey key = RelationGetPartitionKey(parent);
 	List	   *result;
@@ -2090,20 +2150,20 @@ get_qual_for_list(Relation parent, PartitionBoundSpec *spec)
 	 * Only single-column list partitioning is supported, so we are worried
 	 * only about the partition key with index 0.
 	 */
-	Assert(key->partnatts == 1);
+//	Assert(key->partnatts == 1);
 
 	/* Construct Var or expression representing the partition column */
-	if (key->partattrs[0] != 0)
+	if (key->partattrs[partkeyindex] != 0)
 		keyCol = (Expr *) makeVar(1,
-								  key->partattrs[0],
-								  key->parttypid[0],
-								  key->parttypmod[0],
-								  key->parttypcoll[0],
+								  key->partattrs[partkeyindex],
+								  key->parttypid[partkeyindex],
+								  key->parttypmod[partkeyindex],
+								  key->parttypcoll[partkeyindex],
 								  0);
 	else
 		keyCol = (Expr *) copyObject(linitial(key->partexprs));
 
-	/*
+	/* TODO: multi-col
 	 * For default list partition, collect datums for all the partitions. The
 	 * default partition constraint should check that the partition key is
 	 * equal to none of those.
@@ -2139,15 +2199,15 @@ get_qual_for_list(Relation parent, PartitionBoundSpec *spec)
 			 * to copy the value, because our result has to be able to outlive
 			 * the relcache entry we're copying from.
 			 */
-			val = makeConst(key->parttypid[0],
-							key->parttypmod[0],
-							key->parttypcoll[0],
-							key->parttyplen[0],
-							datumCopy(*boundinfo->datums[i],
-									  key->parttypbyval[0],
-									  key->parttyplen[0]),
+			val = makeConst(key->parttypid[partkeyindex],
+							key->parttypmod[partkeyindex],
+							key->parttypcoll[partkeyindex],
+							key->parttyplen[partkeyindex],
+							datumCopy(boundinfo->datums[i][partkeyindex],
+									  key->parttypbyval[partkeyindex],
+									  key->parttyplen[partkeyindex]),
 							false,	/* isnull */
-							key->parttypbyval[0]);
+							key->parttypbyval[partkeyindex]);
 
 			elems = lappend(elems, val);
 		}
@@ -2159,12 +2219,21 @@ get_qual_for_list(Relation parent, PartitionBoundSpec *spec)
 		 */
 		foreach(cell, spec->listdatums)
 		{
-			Const	   *val = castNode(Const, lfirst(cell));
+			Const *val;
+			ListCell *c = cell;
+			if (IsA(lfirst(cell), List))
+			{
+				List 		*rowExpr = lfirst(cell);
+				c = list_nth_cell(rowExpr, partkeyindex);
+			}
+
+			val = castNode(Const, lfirst(c));
 
 			if (val->constisnull)
 				list_has_null = true;
 			else
 				elems = lappend(elems, copyObject(val));
+
 		}
 	}
 
@@ -2174,7 +2243,7 @@ get_qual_for_list(Relation parent, PartitionBoundSpec *spec)
 		 * Generate the operator expression from the non-null partition
 		 * values.
 		 */
-		opexpr = make_partition_op_expr(key, 0, BTEqualStrategyNumber,
+		opexpr = make_partition_op_expr(key, partkeyindex, BTEqualStrategyNumber,
 										keyCol, (Expr *) elems);
 	}
 	else
@@ -2236,6 +2305,17 @@ get_qual_for_list(Relation parent, PartitionBoundSpec *spec)
 		result = list_make1(makeBoolExpr(NOT_EXPR, result, -1));
 	}
 
+	return result;
+}
+
+static List *
+get_qual_for_list(Relation parent, PartitionBoundSpec *spec)
+{
+	List *result = NIL;
+	for (int i = 0; i < RelationGetPartitionKey(parent)->partnatts; i++)
+	{
+		result = list_concat(result, get_qual_for_list_internal(parent, spec, i));
+	}
 	return result;
 }
 
