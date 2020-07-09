@@ -1282,12 +1282,6 @@ get_partition_for_tuple(PartitionKey key, PartitionDesc partdesc, Datum *values,
 			break;
 
 		case PARTITION_STRATEGY_LIST:
-			if (isnull[0])
-			{
-				if (partition_bound_accepts_nulls(boundinfo))
-					part_index = boundinfo->null_index;
-			}
-			else
 			{
 				bool		equal = false;
 
@@ -1295,7 +1289,7 @@ get_partition_for_tuple(PartitionKey key, PartitionDesc partdesc, Datum *values,
 													  key->partcollation,
 													  key->partnatts,
 													  boundinfo,
-													  values, &equal);
+													  values, isnull, &equal);
 				if (bound_offset >= 0 && equal)
 					part_index = boundinfo->indexes[bound_offset];
 			}

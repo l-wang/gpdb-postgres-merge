@@ -285,6 +285,33 @@ datums_to_consts(PartitionKey partkey, Datum *datums)
 	return result;
 }
 
+bool *
+consts_to_isnull(PartitionKey partkey, List *consts)
+{
+	bool	   *isnull;
+	ListCell   *lc;
+	int			i;
+
+	if (partkey->partnatts != list_length(consts))
+		elog(ERROR, "wrong number of partition bounds, expected number of attributes is %d, got %d", partkey->partnatts, list_length(consts));
+
+	isnull = (bool *)palloc0(partkey->partnatts * sizeof(bool));
+
+	i = 0;
+	foreach(lc, consts)
+	{
+		Const	   *c = (Const *) lfirst(lc);
+
+		if (!IsA(c, Const))
+			elog(ERROR, "expected Const in partition bound");
+
+		isnull[i] = c->constisnull;
+		i++;
+	}
+
+	return isnull;
+}
+
 Datum *
 consts_to_datums(PartitionKey partkey, List *consts)
 {
@@ -293,7 +320,7 @@ consts_to_datums(PartitionKey partkey, List *consts)
 	int			i;
 
 	if (partkey->partnatts != list_length(consts))
-		elog(ERROR, "wrong number of partition bounds, expected number of attributes is %d, got %d", partkey->partattrs, list_length(consts));
+		elog(ERROR, "wrong number of partition bounds, expected number of attributes is %d, got %d", partkey->partnatts, list_length(consts));
 
 	datums = palloc(partkey->partnatts * sizeof(Datum));
 

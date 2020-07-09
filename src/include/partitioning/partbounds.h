@@ -62,6 +62,7 @@ typedef struct PartitionBoundInfoData
 	char		strategy;		/* hash, list or range? */
 	int			ndatums;		/* Length of the datums following array */
 	Datum	  **datums;
+	bool	   **isnull; /* this is for list partitioned tables only, NULL for hash and range partitioned tables*/
 	PartitionRangeDatumKind **kind; /* The kind of each range bound datum;
 									 * NULL for hash and list partitioned
 									 * tables */
@@ -103,7 +104,7 @@ extern int	partition_list_bsearch(FmgrInfo *partsupfunc,
 								   Oid *partcollation,
 								   int partnatts,
 								   PartitionBoundInfo boundinfo,
-								   Datum *values, bool *is_equal);
+								   Datum *values, bool *isnull, bool *is_equal);
 extern int	partition_range_datum_bsearch(FmgrInfo *partsupfunc,
 										  Oid *partcollation,
 										  PartitionBoundInfo boundinfo,

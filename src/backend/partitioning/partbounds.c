@@ -61,6 +61,7 @@ typedef struct PartitionListValue
 {
 	int			index;
 	Datum		*values;
+	bool		*isnulls;
 } PartitionListValue;
 
 /* One bound of a range partition */
@@ -354,6 +355,7 @@ create_list_bounds(PartitionBoundSpec **boundspecs, int nparts,
 			PartitionListValue *list_value = NULL;
 			list_value = (PartitionListValue *) palloc0(sizeof(PartitionListValue));
 			list_value->values = (Datum *) palloc0(key->partnatts * sizeof(Datum));
+			list_value->isnulls = (bool *) palloc0(key->partnatts * sizeof(bool));
 			int j = 0;
 			if (IsA(lfirst(c), List))
 			{
@@ -369,14 +371,9 @@ create_list_bounds(PartitionBoundSpec **boundspecs, int nparts,
 					}
 					else
 					{
-						/*
-						 * Never put a null into the values array, flag instead for
-						 * the code further down below where we construct the actual
-						 * relcache struct.
-						 */
-						if (null_index != -1)
-							elog(ERROR, "found null more than once");
-						null_index = i;
+						list_value->index = i;
+						list_value->values[j] = 0;
+						list_value->isnulls[j++] = true;
 					}
 				}
 			}
@@ -391,14 +388,9 @@ create_list_bounds(PartitionBoundSpec **boundspecs, int nparts,
 				}
 				else
 				{
-					/*
-					 * Never put a null into the values array, flag instead for
-					 * the code further down below where we construct the actual
-					 * relcache struct.
-					 */
-					if (null_index != -1)
-						elog(ERROR, "found null more than once");
-					null_index = i;
+					list_value->index = i;
+					list_value->values[0] = 0;
+					list_value->isnulls[0] = true;
 				}
 			}
 			if (list_value)
@@ -415,14 +407,20 @@ create_list_bounds(PartitionBoundSpec **boundspecs, int nparts,
 	all_values = (PartitionListValue **)
 		palloc(ndatums * sizeof(PartitionListValue *));
 	i = 0;
+	/*
+	 * TODO: use list_qsort directly on non_null_values instead.
+	 * Also rename non_null_values to something like all_values
+	*/
 	foreach(cell, non_null_values)
 	{
 		PartitionListValue *src = lfirst(cell);
 
 		all_values[i] = (PartitionListValue *)
-			palloc(sizeof(PartitionListValue));
-		all_values[i]->values = (Datum *)palloc(key->partnatts * sizeof(Datum));
+			palloc0(sizeof(PartitionListValue));
+		all_values[i]->values = (Datum *)palloc0(key->partnatts * sizeof(Datum));
+		all_values[i]->isnulls = (bool *)palloc0(key->partnatts * sizeof(bool));
 		memcpy(all_values[i]->values, src->values, key->partnatts * sizeof(Datum));
+		memcpy(all_values[i]->isnulls, src->isnulls, key->partnatts * sizeof(bool));
 		all_values[i]->index = src->index;
 		i++;
 	}
@@ -431,7 +429,8 @@ create_list_bounds(PartitionBoundSpec **boundspecs, int nparts,
 			  qsort_partition_list_value_cmp, (void *) key);
 
 	boundinfo->ndatums = ndatums;
-	boundinfo->datums = (Datum **) palloc0(ndatums * sizeof(Datum *));
+	boundinfo->datums  = (Datum **) palloc0(ndatums * sizeof(Datum *));
+	boundinfo->isnull  = (bool **) palloc0(ndatums * sizeof(bool *));
 	boundinfo->indexes = (int *) palloc(ndatums * sizeof(int));
 
 	/*
@@ -444,12 +443,22 @@ create_list_bounds(PartitionBoundSpec **boundspecs, int nparts,
 	{
 		int			orig_index = all_values[i]->index;
 
-		boundinfo->datums[i] = (Datum *) palloc(key->partnatts * sizeof(Datum));
+		boundinfo->datums[i] = (Datum *) palloc0(key->partnatts * sizeof(Datum));
+		boundinfo->isnull[i] = (bool *) palloc0(key->partnatts * sizeof(bool));
 		for(int k = 0; k < key->partnatts; k++)
 		{
-			boundinfo->datums[i][k] = datumCopy(all_values[i]->values[k],
-												key->parttypbyval[k],
-												key->parttyplen[k]);
+			if (all_values[i]->isnulls[k])
+			{
+				boundinfo->isnull[i][k] = true;
+				boundinfo->datums[i][k] = 0;
+			}
+			else
+			{
+				boundinfo->isnull[i][k] = false;
+				boundinfo->datums[i][k] = datumCopy(all_values[i]->values[k],
+													key->parttypbyval[k],
+													key->parttyplen[k]);
+			}
 		}
 
 		/* If the old index has no mapping, assign one */
@@ -779,6 +788,15 @@ partition_bounds_equal(int partnatts, int16 *parttyplen, bool *parttypbyval,
 						continue;
 				}
 
+				if (b1->strategy == PARTITION_STRATEGY_LIST)
+				{
+					if ((b1->isnull[i][j] && !b2->isnull[i][j]) ||
+						(!b1->isnull[i][j] && b2->isnull[i][j]))
+						return false;
+					if (b1->isnull[i][j])
+						continue;
+				}
+
 				/*
 				 * Compare the actual values. Note that it would be both
 				 * incorrect and unsafe to invoke the comparison operator
@@ -835,6 +853,7 @@ partition_bounds_copy(PartitionBoundInfo src,
 //	Assert(key->strategy != PARTITION_STRATEGY_LIST || partnatts == 1);
 
 	dest->datums = (Datum **) palloc(sizeof(Datum *) * ndatums);
+	dest->isnull = (bool **) palloc0(sizeof(bool *) * ndatums);
 
 	if (src->kind != NULL)
 	{
@@ -864,6 +883,8 @@ partition_bounds_copy(PartitionBoundInfo src,
 		int			natts = hash_part ? 2 : partnatts;
 
 		dest->datums[i] = (Datum *) palloc(sizeof(Datum) * natts);
+		if (key->strategy == PARTITION_STRATEGY_LIST)
+			dest->isnull[i] = (bool *) palloc0(sizeof(bool) * natts);
 
 		for (j = 0; j < natts; j++)
 		{
@@ -883,8 +904,17 @@ partition_bounds_copy(PartitionBoundInfo src,
 
 			if (dest->kind == NULL ||
 				dest->kind[i][j] == PARTITION_RANGE_DATUM_VALUE)
-				dest->datums[i][j] = datumCopy(src->datums[i][j],
+			{
+				if (key->strategy == PARTITION_STRATEGY_LIST && src->isnull[i][j])
+				{
+					dest->isnull[i][j] = true;
+					dest->datums[i][j] = 0;
+				}
+				else
+					dest->datums[i][j] = datumCopy(src->datums[i][j],
 											   byval, typlen);
+			}
+
 		}
 	}
 
@@ -1093,23 +1123,25 @@ check_new_partition_bound(char *relname, Relation parent,
 					Assert(boundinfo &&
 						   boundinfo->strategy == PARTITION_STRATEGY_LIST &&
 						   (boundinfo->ndatums > 0 ||
-							partition_bound_accepts_nulls(boundinfo) ||
 							partition_bound_has_default(boundinfo)));
 
 					foreach(cell, spec->listdatums)
 					{
 						Datum *values;
+						bool  *isnull;
 						int			offset;
 						bool		equal;
 						if (IsA(lfirst(cell), List))
 						{
 							List 		*list = lfirst(cell);
 							values = consts_to_datums(key, list);
+							isnull = consts_to_isnull(key, list);
 						}
 						else
 						{
 							Const	   *val = castNode(Const, lfirst(cell));
 							values[0] = val->constvalue;
+							isnull[0] = val->constisnull;
 						}
 
 						offset = partition_list_bsearch(key->partsupfunc,
@@ -1117,6 +1149,7 @@ check_new_partition_bound(char *relname, Relation parent,
 														key->partnatts,
 														boundinfo,
 														values,
+														isnull,
 														&equal);
 						if (offset >= 0 && equal)
 						{
@@ -1614,7 +1647,7 @@ partition_hbound_cmp(int modulus1, int remainder1, int modulus2, int remainder2)
 int
 partition_list_bsearch(FmgrInfo *partsupfunc, Oid *partcollation, int partnatts,
 					   PartitionBoundInfo boundinfo,
-					   Datum *values, bool *is_equal)
+					   Datum *values, bool *isnull, bool *is_equal)
 {
 	int			lo,
 				hi,
@@ -1639,7 +1672,16 @@ partition_list_bsearch(FmgrInfo *partsupfunc, Oid *partcollation, int partnatts,
 			int32 cmpval_in = 0;
 			Datum		val2 = values[i];
 			Datum		val1 = boundinfo->datums[mid][i];
-			cmpval_in = DatumGetInt32(FunctionCall2Coll(&partsupfunc[i],
+			bool		isnull2 = isnull[i];
+			bool		isnull1 = boundinfo->isnull[mid][i];
+			if (isnull2 && isnull1)
+				cmpval_in = 0;
+			else if (isnull1)
+				cmpval_in = -1;
+			else if (isnull2)
+				cmpval_in = 1;
+			else
+				cmpval_in = DatumGetInt32(FunctionCall2Coll(&partsupfunc[i],
 													 partcollation[i],
 													 val1, val2));
 			if (cmpval_in != 0)
@@ -1826,7 +1868,16 @@ qsort_partition_list_value_cmp(const void *a, const void *b, void *arg)
 		int cmpval;
 		Datum		val1 = (*(PartitionListValue *const *) a)->values[i],
 					 val2 = (*(PartitionListValue *const *) b)->values[i];
-		cmpval = DatumGetInt32(FunctionCall2Coll(&key->partsupfunc[i],
+		bool		isnull1 = (*(PartitionListValue *const *) a)->isnulls[i],
+					 isnull2 = (*(PartitionListValue *const *) b)->isnulls[i];
+		if (isnull1 && isnull2)
+			cmpval = 0;
+		else if (isnull1)
+			return -1;
+		else if (isnull2)
+			return 1;
+		else
+			cmpval = DatumGetInt32(FunctionCall2Coll(&key->partsupfunc[i],
 											   key->partcollation[i],
 											   val1, val2));
 		if (cmpval != 0)
@@ -2163,7 +2214,7 @@ get_qual_for_list_internal(Relation parent, PartitionBoundSpec *spec, int partke
 	else
 		keyCol = (Expr *) copyObject(linitial(key->partexprs));
 
-	/* TODO: multi-col
+	/*
 	 * For default list partition, collect datums for all the partitions. The
 	 * default partition constraint should check that the partition key is
 	 * equal to none of those.
@@ -2176,37 +2227,45 @@ get_qual_for_list_internal(Relation parent, PartitionBoundSpec *spec, int partke
 		PartitionBoundInfo boundinfo = pdesc->boundinfo;
 
 		if (boundinfo)
-		{
 			ndatums = boundinfo->ndatums;
-
-			if (partition_bound_accepts_nulls(boundinfo))
-				list_has_null = true;
-		}
 
 		/*
 		 * If default is the only partition, there need not be any partition
 		 * constraint on it.
 		 */
-		if (ndatums == 0 && !list_has_null)
+		if (ndatums == 0)
 			return NIL;
 
 		for (i = 0; i < ndatums; i++)
 		{
 			Const	   *val;
+			bool		constisnull;
+			Datum 		constvalue;
 
 			/*
 			 * Construct Const from known-not-null datum.  We must be careful
 			 * to copy the value, because our result has to be able to outlive
 			 * the relcache entry we're copying from.
 			 */
+			if (boundinfo->isnull[i][partkeyindex])
+			{
+				constisnull = true;
+				constvalue = 0;
+				list_has_null = true;
+			}
+			else
+			{
+				constisnull = false;
+				constvalue = datumCopy(boundinfo->datums[i][partkeyindex],
+									   key->parttypbyval[partkeyindex],
+									   key->parttyplen[partkeyindex]);
+			}
 			val = makeConst(key->parttypid[partkeyindex],
 							key->parttypmod[partkeyindex],
 							key->parttypcoll[partkeyindex],
 							key->parttyplen[partkeyindex],
-							datumCopy(boundinfo->datums[i][partkeyindex],
-									  key->parttypbyval[partkeyindex],
-									  key->parttyplen[partkeyindex]),
-							false,	/* isnull */
+							constvalue,
+							constisnull,
 							key->parttypbyval[partkeyindex]);
 
 			elems = lappend(elems, val);

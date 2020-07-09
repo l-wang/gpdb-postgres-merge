@@ -51,6 +51,7 @@ extern void convert_exclusive_start_inclusive_end(Const *constval, Oid part_col_
 												  int32 part_col_typmod, bool is_exclusive_start);
 
 extern Datum *consts_to_datums(PartitionKey partkey, List *consts);
+extern bool *consts_to_isnull(PartitionKey partkey, List *consts);
 
 typedef struct partname_comp
 {
