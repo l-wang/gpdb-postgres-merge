@@ -714,6 +714,7 @@ _outDynamicSeqScan(StringInfo str, const DynamicSeqScan *node)
 
 	_outScanInfo(str, (Scan *)node);
 	WRITE_NODE_FIELD(partOids);
+	WRITE_NODE_FIELD(partitionSelectorParamIds);
 }
 
 static void

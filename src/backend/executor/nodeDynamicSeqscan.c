@@ -139,6 +139,7 @@ ExecInitDynamicSeqScan(DynamicSeqScan *node, EState *estate, int eflags)
 	foreach_with_count(lc, node->partOids, i)
 		state->partOids[i] = lfirst_oid(lc);
 	state->whichPart = -1;
+	state->validParts = bms_add_range(NULL, 0, state->nOids - 1);
 
 	reloid = exec_rt_fetch(node->seqscan.scanrelid, estate)->relid;
 	Assert(OidIsValid(reloid));
@@ -185,7 +186,7 @@ initNextTableToScan(DynamicSeqScanState *node)
 	Oid		   *pid;
 	Relation	currentRelation;
 
-	if (++node->whichPart < node->nOids)
+	if ((node->whichPart = bms_next_member(node->validParts, node->whichPart)) >= 0)
 		pid = &node->partOids[node->whichPart];
 	else
 		return false;

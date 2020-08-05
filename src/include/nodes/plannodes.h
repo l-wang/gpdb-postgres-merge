@@ -768,6 +768,7 @@ typedef struct DynamicSeqScan
 	 * List of partition OIDs to scan.
 	 */
 	List	   *partOids;
+	List	   *partitionSelectorParamIds;
 } DynamicSeqScan;
 
 /* ----------------

@@ -951,6 +951,7 @@ _readDynamicSeqScan(void)
 
 	ReadCommonScan(&local_node->seqscan);
 	READ_NODE_FIELD(partOids);
+	READ_NODE_FIELD(partitionSelectorParamIds);
 
 	READ_DONE();
 }

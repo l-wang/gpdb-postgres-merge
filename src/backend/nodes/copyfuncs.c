@@ -617,6 +617,7 @@ _copyDynamicSeqScan(const DynamicSeqScan *from)
 
 	CopyScanFields((Scan *) from, (Scan *) newnode);
 	COPY_NODE_FIELD(partOids);
+	COPY_NODE_FIELD(partitionSelectorParamIds);
 
 	return newnode;
 }

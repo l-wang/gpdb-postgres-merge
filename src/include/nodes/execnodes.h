@@ -2151,6 +2151,7 @@ typedef struct DynamicSeqScanState
 	int			nOids;
 	Oid		   *partOids;
 	int			whichPart;
+	Bitmapset  *validParts;
 } DynamicSeqScanState;
 
 /* ----------------
