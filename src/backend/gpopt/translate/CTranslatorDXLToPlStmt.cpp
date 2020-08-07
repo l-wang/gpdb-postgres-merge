@@ -21,10 +21,13 @@ extern "C"
 #include "nodes/nodes.h"
 #include "nodes/plannodes.h"
 #include "nodes/primnodes.h"
+#include "partitioning/partdefs.h"
+#include "partitioning/partdesc.h"
 #include "catalog/gp_distribution_policy.h"
 #include "catalog/pg_collation.h"
 #include "cdb/cdbutil.h"
 #include "cdb/cdbvars.h"
+#include "utils/partcache.h"
 #if 0
 #include "cdb/partitionselection.h"
 #endif
@@ -36,6 +39,7 @@ extern "C"
 }
 #include "gpos/base.h"
 
+#include <numeric>
 #include "gpopt/mdcache/CMDAccessor.h"
 #include "gpopt/translate/CTranslatorDXLToPlStmt.h"
 #include "gpopt/translate/CTranslatorUtils.h"
@@ -3225,7 +3229,44 @@ CTranslatorDXLToPlStmt::TranslateDXLPartSelector
 	// selector
 	const bool dynamic_pruning = (EdxlpsIndexChild == partition_selector_dxlnode->Arity() - 1);
 	if (!dynamic_pruning)
-		return reinterpret_cast<Plan *>(MakeNode(Result));
+	{
+		auto dxl_part_selector = dynamic_cast<CDXLPhysicalPartitionSelector *>(
+			partition_selector_dxlnode->GetOperator());
+		auto oid = dynamic_cast<CMDIdGPDB *>(dxl_part_selector->GetRelMdId())->Oid();
+		auto relation = gpdb::GetRelation(oid);
+		PartitionSelector *partition_selector = MakeNode(PartitionSelector);
+		partition_selector->paramid = m_dxl_to_plstmt_context->GetNextParamId(InvalidOid);
+		partition_selector->part_prune_info = MakeNode(PartitionPruneInfo);
+		PartitionedRelPruneInfo *prelinfo = MakeNode(PartitionedRelPruneInfo);
+		Index index = gpdb::ListLength(m_dxl_to_plstmt_context->GetRTableEntriesList()) + 1;
+		RangeTblEntry *rte = MakeNode(RangeTblEntry);
+		rte->relid = oid;
+		rte->rellockmode = AccessShareLock;
+		rte->alias = MakeNode(Alias);
+		rte->eref = rte->alias;
+		m_dxl_to_plstmt_context->AddRTE(rte);
+		prelinfo->rtindex = index;
+		prelinfo->nparts = relation->rd_partdesc->nparts;
+		prelinfo->present_parts = bms_add_range(NULL, 0, prelinfo->nparts - 1);
+		prelinfo->subpart_map = static_cast<int*>(palloc(sizeof(int) * prelinfo->nparts));
+		std::fill(prelinfo->subpart_map, prelinfo->subpart_map + prelinfo->nparts, -1);
+		prelinfo->subplan_map = static_cast<int*>(palloc(sizeof(int) * prelinfo->nparts));
+		std::iota(prelinfo->subplan_map, prelinfo->subplan_map + prelinfo->nparts, 0);
+		prelinfo->relid_map = static_cast<Oid*>(palloc(sizeof(Oid) * prelinfo->nparts));
+		std::copy(relation->rd_partdesc->oids, relation->rd_partdesc->oids + relation->rd_partdesc->nparts, prelinfo->relid_map);
+
+		auto opstep = MakeNode(PartitionPruneStepOp);
+		opstep->step.step_id = 0;
+		opstep->opstrategy = BTLessStrategyNumber;
+		auto int_const = gpdb::MakeIntConst(4200);
+		opstep->exprs = ListMake1(int_const);
+		opstep->cmpfns = ListMake1Oid(relation->rd_partkey->partsupfunc[0].fn_oid);
+		prelinfo->exec_pruning_steps = ListMake1(opstep);
+		gpdb::CloseRelation(relation);
+		partition_selector->part_prune_info->prune_infos = ListMake1(ListMake1(prelinfo));
+		partition_selector->plan.lefttree = reinterpret_cast<Plan *>(MakeNode(Result));
+		return reinterpret_cast<Plan *>(partition_selector);
+	}
 	else
 		return nullptr;
 
@@ -3808,6 +3849,7 @@ CTranslatorDXLToPlStmt::TranslateDXLDynTblScan
 	DynamicSeqScan *dyn_seq_scan = MakeNode(DynamicSeqScan);
 
 	dyn_seq_scan->seqscan.scanrelid = index;
+	dyn_seq_scan->partitionSelectorParamIds = ListMake1Int(0);
 	// GPDB_12_MERGE_FIXME: broken with the Partition Selector refactoring
 #if 0
 	dyn_seq_scan->partIndex = dyn_tbl_scan_dxlop->GetPartIndexId();

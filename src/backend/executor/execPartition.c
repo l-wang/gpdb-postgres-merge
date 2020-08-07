@@ -2045,6 +2045,9 @@ ExecFindMatchingSubPlans(PartitionPruneState *prunestate,
 	int			i;
 	Bitmapset  *join_selected = NULL;
 
+	/*
+	 * FIXME extract this
+	 */
 	if (join_prune_paramids)
 	{
 		ListCell   *lc;

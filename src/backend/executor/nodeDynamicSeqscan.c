@@ -139,7 +139,7 @@ ExecInitDynamicSeqScan(DynamicSeqScan *node, EState *estate, int eflags)
 	foreach_with_count(lc, node->partOids, i)
 		state->partOids[i] = lfirst_oid(lc);
 	state->whichPart = -1;
-	state->validParts = bms_add_range(NULL, 0, state->nOids - 1);
+	state->validParts = NULL;
 
 	reloid = exec_rt_fetch(node->seqscan.scanrelid, estate)->relid;
 	Assert(OidIsValid(reloid));
@@ -186,6 +186,43 @@ initNextTableToScan(DynamicSeqScanState *node)
 	Oid		   *pid;
 	Relation	currentRelation;
 
+	/*
+	 * FIXME copy pasted from execPartition.c
+	 */
+	if (node->whichPart == -1 && node->validParts == NULL)
+	{
+		ListCell   *lc;
+		Bitmapset *join_selected = bms_add_range(NULL, 0, node->nOids - 1);
+
+		foreach (lc, plan->partitionSelectorParamIds)
+		{
+			int			paramid = lfirst_int(lc);
+			ParamExecData *param;
+			PartitionSelectorState *psstate;
+
+			param = &(estate->es_param_exec_vals[paramid]);
+			Assert(param->execPlan == NULL);
+			Assert(!param->isnull);
+			psstate = (PartitionSelectorState *) DatumGetPointer(param->value);
+
+			if (psstate == NULL)
+			{
+				/*
+				 * The planner should have ensured that the Partition Selector
+				 * is fully executed before the Append.
+				 */
+				elog(WARNING, "partition selector was not fully executed");
+			}
+			else
+			{
+				Assert(IsA(psstate, PartitionSelectorState));
+
+				join_selected = bms_intersect(join_selected,
+											  psstate->part_prune_result);
+			}
+		}
+		node->validParts = join_selected;
+	}
 	if ((node->whichPart = bms_next_member(node->validParts, node->whichPart)) >= 0)
 		pid = &node->partOids[node->whichPart];
 	else
